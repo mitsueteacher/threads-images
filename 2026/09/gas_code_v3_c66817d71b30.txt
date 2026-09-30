@@ -1,0 +1,594 @@
+/**
+ * Threads クラウド自動投稿（GAS版）
+ * 仮想制作オフィス / 3アカウント自動予約投稿
+ *
+ * 仕組み:
+ *  - Googleスプレッドシートの「投稿キュー」シートを読む。
+ *  - 「承認」= TRUE かつ 予定日時が現在時刻を過ぎていて まだ未投稿 の行を投稿する。
+ *  - 時間主導トリガー（15分ごと推奨）でこの checkAndPost を回す。
+ *  - トークンは Script Properties に入れる（このコードには書かない）。
+ *
+ * 安全設計:
+ *  - 承認チェックが入っていない投稿は絶対に公開しない（オーナー確認ゲート）。
+ *  - 一度投稿した行は「投稿済み」にして二重投稿しない。
+ *  - 1回の実行で投稿する最大件数を制限（暴走防止）。
+ */
+
+// ===== 設定 =====
+var SHEET_NAME = '投稿キュー';
+var GRAPH_BASE = 'https://graph.threads.net/v1.0';
+var MAX_POSTS_PER_RUN = 5;          // 1回のトリガーで投稿する最大件数
+var TEXT_LIMIT = 500;               // Threadsテキスト上限
+
+var CAROUSEL_MAX = 20;              // カルーセルの最大枚数
+var RUN_BUDGET_MS = 4 * 60 * 1000;  // GASの実行上限(6分)に余裕を残し、4分を過ぎたら次の投稿に手をつけない
+var THREAD_SEPARATOR = /\n\s*---\s*\n/; // 続き列で2本目・3本目を区切る行
+
+// ブランド → トークンを入れる Script Property のキー
+var TOKEN_KEYS = {
+  '縁つむぎ婆': 'THREADS_TOKEN_TSUMUGI',
+  '恋愛の魔女アユ': 'THREADS_TOKEN_AYU',
+  'みつえ先生': 'THREADS_TOKEN_MITSUE',
+  'まゆみ': 'THREADS_TOKEN_MAYUMI'
+};
+
+// ブランド → Threadsのユーザー名。PCからトークンを届ける時、そのトークンが本当にこのアカウントのものか確かめるのに使う。
+var BRAND_HANDLES = {
+  '縁つむぎ婆': 'tsumugi.en_uranai',
+  '恋愛の魔女アユ': 'yoru.no.ayu_uranai',
+  'みつえ先生': 'mitsu.esensei_uranai',
+  'まゆみ': 'mayumi_lovetarot'
+};
+
+// 列の位置（1始まり）。README のシート設計と一致させる。
+// I〜K列は 2026-09-15 にまゆみの画像つき投稿のため追加。空なら従来どおり文字だけ投稿になる。
+var COL = {
+  brand: 1,      // A ブランド
+  handle: 2,     // B アカウント(@なし)
+  datetime: 3,   // C 予定日時
+  text: 4,       // D 本文
+  approved: 5,   // E 承認（チェックボックス）
+  status: 6,     // F 状態
+  result: 7,     // G 投稿ID / エラー内容
+  postedAt: 8,   // H 投稿実行時刻
+  images: 9,     // I 画像URL（1行に1つ。2つ以上でカルーセル）
+  preview: 10,   // J プレビュー（=IMAGE式。投稿判定には使わない）
+  thread: 11     // K 続き（返信でつなぐ2本目以降。複数は「---」だけの行で区切る）
+};
+var COL_COUNT = 11;
+var HEADERS = ['ブランド', 'アカウント', '予定日時', '本文', '承認', '状態', '結果', '投稿実行時刻', '画像URL', 'プレビュー', '続き'];
+
+/**
+ * ドライブへのアクセス許可を出すためだけの関数（2026-09-30 追加）。
+ *
+ * saveUrlToDrive が DriveApp を使うようになったため、スクリプトに
+ * 「ドライブを触ってよい」という許可を1回だけ与える必要がある。
+ * この関数をエディタで一度[実行]すると、許可を求める画面が出る。
+ * 許可した後は、Web App（saveToDrive）からも動くようになる。
+ *
+ * 何も変更しない。フォルダ名を読むだけ。
+ */
+function authorizeDrive() {
+  // 読むだけだと readonly の権限しか要求されず、保存（createFile）で弾かれる。
+  // なので、ここでは実際に小さなファイルを作ってすぐゴミ箱へ入れる。
+  // こうすると drive（読み書き）の権限が要求される。
+  var probe = DriveApp.getRootFolder().createFile('_権限確認_削除してよい.txt', 'ok', MimeType.PLAIN_TEXT);
+  var id = probe.getId();
+  probe.setTrashed(true);
+  Logger.log('ドライブへの読み書きができました（確認用ファイルはゴミ箱へ入れました）: ' + id);
+  return id;
+}
+
+/**
+ * トリガーから呼ばれるメイン関数。
+ */
+function checkAndPost() {
+  var ss = SpreadsheetApp.getActive();
+  // 「投稿キュー」タブがあればそれを、無ければ最初のタブを使う。
+  var sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+  if (!sheet) {
+    throw new Error('シートが見つかりません。');
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return; // ヘッダのみ
+
+  ensureColumns(sheet);
+  var startedAt = Date.now();
+  var now = new Date();
+  var values = sheet.getRange(2, 1, lastRow - 1, COL_COUNT).getValues();
+  var postedCount = 0;
+
+  for (var i = 0; i < values.length; i++) {
+    if (postedCount >= MAX_POSTS_PER_RUN) break;
+    if (Date.now() - startedAt > RUN_BUDGET_MS) break; // 残りは次のトリガーで投稿する
+
+    var row = values[i];
+    var rowIndex = i + 2; // 実シート行
+
+    var brand = String(row[COL.brand - 1]).trim();
+    var text = String(row[COL.text - 1]);
+    var approved = row[COL.approved - 1] === true;
+    var status = String(row[COL.status - 1]).trim();
+    var scheduled = row[COL.datetime - 1];
+
+    // 既に処理済み・未承認・本文なしはスキップ（一部エラー＝1本目は公開済みなので再投稿しない）
+    if (status === '投稿済み' || status === 'エラー' || status === '一部エラー') continue;
+    if (!approved) continue;
+    if (!brand || !text) continue;
+
+    // 予定時刻がまだ来ていない場合はスキップ
+    var scheduledDate = (scheduled instanceof Date) ? scheduled : new Date(scheduled);
+    if (isNaN(scheduledDate.getTime())) {
+      writeResult(sheet, rowIndex, 'エラー', '予定日時が読めません: ' + scheduled, now);
+      continue;
+    }
+    if (scheduledDate.getTime() > now.getTime()) continue;
+
+    var imageUrls = splitImages(row[COL.images - 1]);
+    var follows = splitThread(row[COL.thread - 1]);
+
+    // 投稿実行（1本目が失敗したらエラー。1本目が出た後の続きで失敗したら一部エラー）
+    var ids = [];
+    try {
+      checkLength('本文', text);
+      follows.forEach(function (f, n) { checkLength('続き' + (n + 1), f); });
+      if (imageUrls.length > CAROUSEL_MAX) {
+        throw new Error('画像は' + CAROUSEL_MAX + '枚までです（' + imageUrls.length + '枚）');
+      }
+      imageUrls.forEach(function (url) {
+        if (!/^https:\/\//.test(url)) throw new Error('画像URLは https:// で始まる公開URLにしてください: ' + url);
+      });
+      var token = getToken(brand);
+      ids.push(publishMainPost(token, text, imageUrls));
+      for (var f = 0; f < follows.length; f++) {
+        Utilities.sleep(3000);
+        ids.push(publishContainer(token, { media_type: 'TEXT', text: follows[f], reply_to_id: ids[ids.length - 1] }));
+      }
+      writeResult(sheet, rowIndex, '投稿済み', ids.join(' / '), now);
+      postedCount++;
+    } catch (e) {
+      var message = String(e && e.message ? e.message : e);
+      if (ids.length) {
+        writeResult(sheet, rowIndex, '一部エラー', '公開済み: ' + ids.join(' / ') + ' ／ 続きで失敗: ' + message, now);
+        postedCount++;
+      } else {
+        writeResult(sheet, rowIndex, 'エラー', message, now);
+      }
+    }
+  }
+}
+
+/**
+ * 予定日時を「yyyy-MM-dd HH:mm」の文字列にそろえる（上書き対象の突き合わせ用）。
+ */
+function scheduleKey(value) {
+  var d = (value instanceof Date) ? value : new Date(value);
+  if (isNaN(d.getTime())) return String(value).trim();
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+}
+
+function lastRowForReplace(sheet) {
+  return Math.max(sheet.getLastRow(), 1);
+}
+
+/**
+ * 指定した日付（yyyy-MM-dd）の「未承認・未投稿」の行を空にする（2026-09-18追加）。
+ * 承認済みの行と、状態が入っている行（投稿済み・エラー）には触れない。
+ * 行は削除せず中身だけ消すので、空いた行は doPost の追加でそのまま再利用される。
+ */
+function clearPendingRows(sheet, dates) {
+  var targets = {};
+  [].concat(dates).forEach(function (d) { targets[String(d).trim()] = true; });
+  var lastRow = lastRowForReplace(sheet);
+  if (lastRow < 2) return 0;
+
+  var values = sheet.getRange(2, 1, lastRow - 1, COL_COUNT).getValues();
+  var cleared = 0;
+  values.forEach(function (row, i) {
+    if (!row[COL.brand - 1]) return;
+    if (row[COL.approved - 1] === true) return;
+    if (String(row[COL.status - 1]).trim()) return;
+    if (!targets[scheduleKey(row[COL.datetime - 1]).slice(0, 10)]) return;
+    var rowIndex = i + 2;
+    sheet.getRange(rowIndex, 1, 1, COL_COUNT).clearContent();
+    sheet.getRange(rowIndex, COL.approved).insertCheckboxes();
+    sheet.getRange(rowIndex, COL.approved).setValue(false);
+    sheet.setRowHeight(rowIndex, 21);
+    cleared++;
+  });
+  return cleared;
+}
+
+function checkLength(label, value) {
+  if (value.length > TEXT_LIMIT) {
+    throw new Error(label + 'が' + TEXT_LIMIT + '文字を超えています（' + value.length + '字）');
+  }
+}
+
+function splitImages(cell) {
+  return String(cell || '').split(/[\n,]/).map(function (s) { return s.trim(); }).filter(String);
+}
+
+function splitThread(cell) {
+  return String(cell || '').split(THREAD_SEPARATOR).map(function (s) { return s.trim(); }).filter(String);
+}
+
+/**
+ * シートの列が11列に足りなければ増やし、I〜K列の見出しが空なら入れる（3ブランドの既存行はそのまま）。
+ */
+function ensureColumns(sheet) {
+  if (sheet.getMaxColumns() < COL_COUNT) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), COL_COUNT - sheet.getMaxColumns());
+  }
+  var header = sheet.getRange(1, 1, 1, COL_COUNT).getValues()[0];
+  for (var c = COL.images - 1; c < COL_COUNT; c++) {
+    if (!header[c]) sheet.getRange(1, c + 1).setValue(HEADERS[c]);
+  }
+}
+
+/**
+ * 画像をスプレッドシートのエディタから手動で準備したい時用（見出しの追加だけ行う）。
+ */
+function setupImageColumns() {
+  var ss = SpreadsheetApp.getActive();
+  ensureColumns(ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0]);
+}
+
+/**
+ * ブランドに対応するトークンを Script Properties から取得。
+ */
+function getToken(brand) {
+  var key = TOKEN_KEYS[brand];
+  if (!key) throw new Error('未知のブランド: ' + brand);
+  var token = PropertiesService.getScriptProperties().getProperty(key);
+  if (!token) throw new Error(key + ' が Script Properties に設定されていません。');
+  return token;
+}
+
+/**
+ * URLが動画かどうか。拡張子だけで見る（I列に動画のURLを書けば動画投稿になる）。
+ * 2026-09-30 追加。列を増やさずに済ませるため、画像URLの列をそのまま使う。
+ */
+function isVideoUrl(url) {
+  return /\.(mp4|mov)(\?|$)/i.test(String(url || '').split('#')[0]);
+}
+
+/**
+ * 1本目を公開する。
+ *   何もなし = 文字だけ / 動画1本 = 動画投稿 / 画像1枚 = 画像投稿 / 画像2枚以上 = カルーセル。
+ * threads_api/threads_workflow.py の publish_item と同じ手順（PC版で実投稿確認済み）。
+ * 戻り値: 公開後の投稿ID
+ */
+function publishMainPost(token, text, imageUrls) {
+  if (!imageUrls.length) {
+    return publishContainer(token, { media_type: 'TEXT', text: text });
+  }
+
+  // 動画（2026-09-30 追加）。Threads APIは media_type=VIDEO + video_url。
+  // 仕様: MP4/MOV・H264/HEVC・最大1920px・最大5分・最大1GB・moov atomが先頭（faststart）。
+  var videos = imageUrls.filter(isVideoUrl);
+  if (videos.length) {
+    if (imageUrls.length > 1) {
+      throw new Error('動画は1本だけにしてください（動画と画像を混ぜた投稿には未対応）。');
+    }
+    // 動画は取り込みに時間がかかるので、待ち時間を長めに取る
+    return publishContainer(token, { media_type: 'VIDEO', video_url: videos[0], text: text }, 200000);
+  }
+
+  if (imageUrls.length === 1) {
+    return publishContainer(token, { media_type: 'IMAGE', image_url: imageUrls[0], text: text });
+  }
+  var children = imageUrls.map(function (url) {
+    var childId = createContainer(token, { media_type: 'IMAGE', image_url: url, is_carousel_item: 'true' });
+    waitForContainerReady(childId, token);
+    return childId;
+  });
+  return publishContainer(token, { media_type: 'CAROUSEL', children: children.join(','), text: text });
+}
+
+/**
+ * 互換用: 文字だけの投稿（以前の関数名）。
+ */
+function publishThreadsPost(token, text) {
+  return publishContainer(token, { media_type: 'TEXT', text: text });
+}
+
+/**
+ * Threads公式API: コンテナ作成 → 準備完了を待つ → 公開。戻り値: 公開後の投稿ID
+ */
+function publishContainer(token, params, maxWaitMs) {
+  var creationId = createContainer(token, params);
+  waitForContainerReady(creationId, token, maxWaitMs);
+  var pubBody = graphPost(token, 'me/threads_publish', { creation_id: creationId });
+  if (!pubBody.id) throw new Error('公開失敗: ' + JSON.stringify(pubBody));
+  return pubBody.id;
+}
+
+function createContainer(token, params) {
+  var body = graphPost(token, 'me/threads', params);
+  if (!body.id) throw new Error('コンテナ作成失敗: ' + JSON.stringify(body));
+  return body.id;
+}
+
+function graphPost(token, path, params) {
+  var payload = { access_token: token };
+  Object.keys(params).forEach(function (k) { payload[k] = params[k]; });
+  var res = UrlFetchApp.fetch(GRAPH_BASE + '/' + path, { method: 'post', muteHttpExceptions: true, payload: payload });
+  var body = JSON.parse(res.getContentText() || '{}');
+  if (res.getResponseCode() >= 300) throw new Error(path + ' 失敗: ' + res.getContentText());
+  return body;
+}
+
+/**
+ * コンテナ(creationId)の処理が完了する(status=FINISHED)まで待つ。
+ *
+ * 原因（2026-08-11調査）: コンテナ作成は非同期処理のため、作成直後にpublishすると
+ * 「error_subcode 4279009 / Media Not Found」で失敗することがある。
+ * 2026-09-15: 取得フィールドを status_code → status に修正（APIの項目名は status。
+ * 以前は項目が返らず毎回30秒待ってから公開していた）。画像は取り込みに時間がかかるため最大120秒待つ。
+ */
+function waitForContainerReady(creationId, token, maxWaitMs) {
+  var MAX_WAIT_MS = maxWaitMs || 120000;
+  var POLL_INTERVAL_MS = 3000;
+  var waited = 0;
+
+  Utilities.sleep(2000);
+  waited += 2000;
+
+  while (waited < MAX_WAIT_MS) {
+    var statusUrl = GRAPH_BASE + '/' + creationId + '?fields=status,error_message&access_token=' + encodeURIComponent(token);
+    var res = UrlFetchApp.fetch(statusUrl, { muteHttpExceptions: true });
+    var body = JSON.parse(res.getContentText() || '{}');
+    var state = body.status || body.status_code;
+
+    if (state === 'FINISHED') return;
+    if (state === 'ERROR' || state === 'EXPIRED') {
+      throw new Error('コンテナ処理失敗: ' + state + ' ' + (body.error_message || ''));
+    }
+    Utilities.sleep(POLL_INTERVAL_MS);
+    waited += POLL_INTERVAL_MS;
+  }
+  throw new Error('投稿の準備が' + (MAX_WAIT_MS / 1000) + '秒で終わりませんでした');
+}
+
+/**
+ * 結果をシートに書き戻す。
+ */
+function writeResult(sheet, rowIndex, status, result, now) {
+  sheet.getRange(rowIndex, COL.status).setValue(status);
+  sheet.getRange(rowIndex, COL.result).setValue(result);
+  sheet.getRange(rowIndex, COL.postedAt).setValue(
+    Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss')
+  );
+}
+
+/**
+ * 公開URLのファイルを取ってきて、Googleドライブに保存する。
+ * 同じ名前のファイルが既にあれば置き換える（何度走らせても増えない）。
+ * 戻り値: { name, id, url, size }
+ */
+function saveUrlToDrive(url, filename, folderId) {
+  if (!url) throw new Error('url がありません。');
+  var name = filename || String(url).split('/').pop().split('?')[0];
+  name = decodeURIComponent(name);
+
+  var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+  if (res.getResponseCode() >= 300) {
+    throw new Error('取得できませんでした(' + res.getResponseCode() + '): ' + url);
+  }
+  var blob = res.getBlob().setName(name);
+
+  var folder = folderId ? DriveApp.getFolderById(folderId) : DriveApp.getRootFolder();
+
+  // 同じ名前の古いファイルはゴミ箱へ（差し替え）
+  var existing = folder.getFilesByName(name);
+  while (existing.hasNext()) {
+    existing.next().setTrashed(true);
+  }
+
+  var file = folder.createFile(blob);
+  return {
+    name: file.getName(),
+    id: file.getId(),
+    url: file.getUrl(),
+    size: file.getSize()
+  };
+}
+
+/**
+ * 書き込み専用のWeb App窓口。
+ * ClaudeがHTTP POSTで投稿予定を送り、行として追加する。
+ *
+ * リクエストの形:
+ * {
+ *   "secret": "合言葉",
+ *   "posts": [
+ *     {"brand": "みつえ先生", "handle": "mitsu.esensei_uranai", "datetime": "2026-07-09 7:30", "text": "..."},
+ *     {"brand": "まゆみ", "handle": "mayumi_lovetarot", "datetime": "2026-09-17 9:00", "text": "...",
+ *      "images": ["https://raw.githubusercontent.com/..."], "thread": ["2本目", "3本目"]},
+ *     ...
+ *   ]
+ * }
+ *
+ * 安全設計:
+ *  - secret が SCRIPT_WRITE_SECRET と一致しないと何もしない。
+ *  - 承認（E列）は必ずFALSEで追加する。ここではオーナーの確認ゲートを絶対に飛ばさない。
+ *  - 状態・結果・投稿実行時刻は空のまま追加する（checkAndPostが後で埋める）。
+ */
+function doPost(e) {
+  var response = { ok: false, added: 0, errors: [] };
+  try {
+    var body = JSON.parse(e.postData.contents);
+    var ss = SpreadsheetApp.getActive();
+    var sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+    ensureColumns(sheet);
+
+    if (body.action === 'sync') {
+      syncFromPc(body);
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var expected = PropertiesService.getScriptProperties().getProperty('SCRIPT_WRITE_SECRET');
+    if (!expected) {
+      throw new Error('SCRIPT_WRITE_SECRET が Script Properties に設定されていません。');
+    }
+    if (!body.secret || body.secret !== expected) {
+      throw new Error('合言葉が一致しません。');
+    }
+
+    if (body.action === 'clear') {
+      response.cleared = clearPendingRows(sheet, body.dates || []);
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 公開URLのファイルをGoogleドライブへ保存する（2026-09-30 追加）
+    //
+    // なぜ必要か: Instagramのリールは、アプリから手で投稿しないと
+    // Instagramの音源（曲）を付けられない。だから動画はスマホに届いていればよい。
+    // Claude側からドライブへ直接アップロードする手段が無い（コネクタはファイルの中身を
+    // 会話に載せる方式で、動画のサイズでは通らない）。
+    // GASはオーナーのアカウントで動くので、URLを渡せばドライブに置ける。
+    if (body.action === 'saveToDrive') {
+      response.saved = saveUrlToDrive(body.url, body.filename, body.folderId);
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var posts = body.posts || [];
+    if (!posts.length) {
+      throw new Error('posts が空です。');
+    }
+
+    // ブランド(A列)が空の行を2行目から集める。
+    // これで、既にチェックボックスが設定済みの空き行を優先的に再利用する
+    // （appendRowだけだと末尾に追記され、チェックボックス範囲外になることがあるため）。
+    var lastRow = Math.max(sheet.getLastRow(), 1);
+    var emptyRows = [];
+    if (lastRow >= 2) {
+      var brandColumn = sheet.getRange(2, COL.brand, lastRow - 1, 1).getValues();
+      for (var r = 0; r < brandColumn.length; r++) {
+        if (!brandColumn[r][0]) {
+          emptyRows.push(r + 2); // 実シート行番号
+        }
+      }
+    }
+    var nextNewRow = lastRow + 1;
+
+    // 同じブランド・同じ予定日時の「未承認・未投稿」の行があれば、その行を上書きする（2026-09-17 追加。
+    // 送り直しで同じ予定が二重に並ぶのを防ぐ）。承認済みの行は上書きしない。
+    var replaceRows = {};
+    if (lastRowForReplace(sheet) >= 2) {
+      var existing = sheet.getRange(2, 1, lastRowForReplace(sheet) - 1, COL_COUNT).getValues();
+      existing.forEach(function (row, i) {
+        if (!row[COL.brand - 1] || row[COL.approved - 1] === true || String(row[COL.status - 1]).trim()) return;
+        replaceRows[String(row[COL.brand - 1]).trim() + '|' + scheduleKey(row[COL.datetime - 1])] = i + 2;
+      });
+    }
+
+    posts.forEach(function (post) {
+      if (!post.brand || !post.handle || !post.datetime || !post.text) {
+        response.errors.push('必須項目が足りない行をスキップしました: ' + JSON.stringify(post));
+        return;
+      }
+      if (!TOKEN_KEYS[post.brand]) {
+        response.errors.push('未知のブランドの行をスキップしました: ' + post.brand);
+        return;
+      }
+      var images = [].concat(post.images || []).filter(String);
+      var thread = [].concat(post.thread || []).filter(String);
+      var preview = images.length ? '=IMAGE("' + String(images[0]).replace(/"/g, '') + '")' : '';
+      var replaceKey = post.brand + '|' + scheduleKey(post.datetime);
+      var targetRow = replaceRows[replaceKey] || (emptyRows.length > 0 ? emptyRows.shift() : nextNewRow++);
+      delete replaceRows[replaceKey];
+      // 承認(E)は常にFALSEで書き込む。状態・結果・投稿実行時刻(F,G,H)は空にする。
+      sheet.getRange(targetRow, 1, 1, COL_COUNT).setValues(
+        [[post.brand, post.handle, post.datetime, post.text, false, '', '', '',
+          images.join('\n'), preview, thread.join('\n---\n')]]
+      );
+      sheet.getRange(targetRow, COL.approved).insertCheckboxes(); // 末尾に追記した行でもチェックボックスにする
+      sheet.getRange(targetRow, COL.approved).setValue(false);
+      if (preview) sheet.setRowHeight(targetRow, 120);
+      response.added++;
+    });
+
+    response.ok = true;
+  } catch (err) {
+    response.errors.push(String(err && err.message ? err.message : err));
+  }
+  return ContentService
+    .createTextOutput(JSON.stringify(response))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * PCからトークン（と合言葉）を届けてもらう窓口（2026-09-16）。手で貼り付けなくて済むようにする。
+ * {"action":"sync","brand":"まゆみ","token":"...","secret":"..."(任意)}
+ * 安全: 届いたトークンで Threads の /me を呼び、ユーザー名が BRAND_HANDLES と一致した時だけ保存する。
+ * つまり、そのアカウントの有効なトークンを既に持っている人しか書き換えられない。ログにトークンは出さない。
+ */
+function syncFromPc(body) {
+  var brand = String(body.brand || '');
+  var key = TOKEN_KEYS[brand];
+  var handle = BRAND_HANDLES[brand];
+  if (!key || !handle) throw new Error('未知のブランド: ' + brand);
+  var token = String(body.token || '');
+  if (!token) throw new Error('token が空です');
+  var res = UrlFetchApp.fetch(GRAPH_BASE + '/me?fields=username&access_token=' + encodeURIComponent(token), { muteHttpExceptions: true });
+  var me = JSON.parse(res.getContentText() || '{}');
+  if (res.getResponseCode() >= 300 || me.username !== handle) {
+    throw new Error('トークンを確認できませんでした（' + brand + '）');
+  }
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty(key, token);
+  if (body.secret) props.setProperty('SCRIPT_WRITE_SECRET', String(body.secret));
+}
+
+/**
+ * 60日トークンを期限前に延長する（2026-09-15追加）。週1回の時間主導トリガーで回す。
+ * 発行から24時間以上たった、まだ期限内のトークンだけ延長できる。期限切れは再発行が必要。
+ * 延長した新しいトークンは Script Properties に上書き保存する（ログにトークンは出さない）。
+ */
+function refreshTokens() {
+  var props = PropertiesService.getScriptProperties();
+  Object.keys(TOKEN_KEYS).forEach(function (brand) {
+    var key = TOKEN_KEYS[brand];
+    var token = props.getProperty(key);
+    if (!token) {
+      console.log(brand + ': 未設定のためスキップ');
+      return;
+    }
+    var res = UrlFetchApp.fetch('https://graph.threads.net/refresh_access_token?grant_type=th_refresh_token&access_token=' +
+      encodeURIComponent(token), { muteHttpExceptions: true });
+    var body = JSON.parse(res.getContentText() || '{}');
+    if (res.getResponseCode() < 300 && body.access_token) {
+      props.setProperty(key, body.access_token);
+      var expires = new Date(Date.now() + Number(body.expires_in || 0) * 1000);
+      console.log(brand + ': 延長しました（期限 ' + Utilities.formatDate(expires, Session.getScriptTimeZone(), 'yyyy-MM-dd') + '）');
+    } else {
+      console.log(brand + ': 延長に失敗 ' + ((body.error && body.error.message) || res.getContentText()));
+    }
+  });
+}
+
+/**
+ * 接続テスト用。3アカウントのトークンでプロフィールを取得できるか確認する。
+ * 投稿はしない。実行してログを確認する。
+ */
+function testConnections() {
+  var props = PropertiesService.getScriptProperties();
+  Object.keys(TOKEN_KEYS).forEach(function (brand) {
+    var key = TOKEN_KEYS[brand];
+    var token = props.getProperty(key);
+    if (!token) {
+      console.log(brand + ': ' + key + ' 未設定');
+      return;
+    }
+    var res = UrlFetchApp.fetch(GRAPH_BASE + '/me?fields=id,username&access_token=' + encodeURIComponent(token), {
+      muteHttpExceptions: true
+    });
+    console.log(brand + ': ' + res.getContentText());
+  });
+}
