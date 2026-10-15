@@ -439,6 +439,11 @@ function doPost(e) {
     }
 
     // 返信キュー（2026-10-15 追加）: PCが集めたコメントとAIの返信案を「返信キュー」タブに入れる
+    if (body.action === 'replyStatus') {
+      response.status = replyStatus();
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
     if (body.action === 'replies') {
       response.added = addReplyRows(body.rows || []);
       response.ok = true;
@@ -610,6 +615,34 @@ var REPLY_HEADERS = ['ブランド', 'コメントID', '相手', 'コメント',
 var RC = { brand: 1, commentId: 2, user: 3, comment: 4, reply: 5, approved: 6, status: 7, result: 8, sentAt: 9, post: 10, addedAt: 11 };
 var REPLY_DAILY_MAX = 20;
 var REPLY_GAP_MS = 3 * 60 * 1000;
+var REPLY_PAUSE_MS = 24 * 60 * 60 * 1000;  // 制限らしいエラーが出たら、そのアカウントの返信を24時間止める（2026-10-15 オーナー指示）
+var LIMIT_ERROR = /(429|rate.?limit|limit|block|blocked|spam|restrict|temporar|too many|制限|ブロック|一時的)/i;
+
+function pauseKey(brand) { return 'REPLY_PAUSE_UNTIL_' + (TOKEN_KEYS[brand] || brand); }
+
+function replyPausedUntil(brand) {
+  var v = Number(PropertiesService.getScriptProperties().getProperty(pauseKey(brand)) || 0);
+  return v > Date.now() ? v : 0;
+}
+
+// PCが毎朝読む: 止まっているアカウントと、今日送った件数
+function replyStatus() {
+  var out = {};
+  var sh = SpreadsheetApp.getActive().getSheetByName(REPLY_SHEET);
+  var today = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  Object.keys(TOKEN_KEYS).forEach(function (b) { out[b] = { sentToday: 0, waiting: 0, errors: 0, pausedUntil: replyPausedUntil(b) ? Utilities.formatDate(new Date(replyPausedUntil(b)), 'Asia/Tokyo', 'MM/dd HH:mm') : '' }; });
+  if (sh && sh.getLastRow() >= 2) {
+    sh.getRange(2, 1, sh.getLastRow() - 1, REPLY_HEADERS.length).getValues().forEach(function (r) {
+      var b = r[RC.brand - 1];
+      if (!out[b]) return;
+      var st = String(r[RC.status - 1]);
+      if (st === '送信済み' && r[RC.sentAt - 1] && Utilities.formatDate(new Date(r[RC.sentAt - 1]), 'Asia/Tokyo', 'yyyy-MM-dd') === today) out[b].sentToday++;
+      if (!st && r[RC.approved - 1] !== true) out[b].waiting++;
+      if (st.indexOf('エラー') === 0) out[b].errors++;
+    });
+  }
+  return out;
+}
 
 function getReplySheet() {
   var ss = SpreadsheetApp.getActive();
@@ -668,6 +701,7 @@ function sendApprovedReplies() {
     var r = values[i];
     var brand = r[RC.brand - 1];
     if (r[RC.approved - 1] !== true || String(r[RC.status - 1]).trim() || done[brand]) continue;
+    if (replyPausedUntil(brand)) continue; // 制限で止めている間は送らない
     if ((sentToday[brand] || 0) >= REPLY_DAILY_MAX) continue;
     if (lastSent[brand] && (Date.now() - lastSent[brand].getTime()) < REPLY_GAP_MS) continue;
     var rowIndex = i + 2;
@@ -681,8 +715,14 @@ function sendApprovedReplies() {
       sh.getRange(rowIndex, RC.sentAt).setValue(now);
       sentToday[brand] = (sentToday[brand] || 0) + 1;
     } catch (err) {
-      sh.getRange(rowIndex, RC.status).setValue('エラー');
-      sh.getRange(rowIndex, RC.result).setValue(String(err).slice(0, 300));
+      var msg = String(err);
+      if (LIMIT_ERROR.test(msg)) {
+        PropertiesService.getScriptProperties().setProperty(pauseKey(brand), String(Date.now() + REPLY_PAUSE_MS));
+        sh.getRange(rowIndex, RC.status).setValue('エラー（制限のため24時間停止）');
+      } else {
+        sh.getRange(rowIndex, RC.status).setValue('エラー');
+      }
+      sh.getRange(rowIndex, RC.result).setValue(msg.slice(0, 300));
       sh.getRange(rowIndex, RC.sentAt).setValue(now);
     }
     done[brand] = true; // 1回の実行で1アカウント1件まで（5分ごとのトリガーと合わせて間隔があく）
