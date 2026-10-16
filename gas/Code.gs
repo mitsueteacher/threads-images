@@ -452,6 +452,12 @@ function doPost(e) {
       return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
     }
 
+    // 返事の在庫（2026-10-17 追加）: PCから在庫を入れる（承認FALSE）
+    if (body.action === 'bank') {
+      response.added = addBankRows(body.rows || []);
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
     // 予約の重複チェック（2026-10-16 追加・オーナー指示「重複は絶対に防ぐ」）。毎朝 daily_report.py が読む
     if (body.action === 'queueCheck') {
       response.check = checkQueue(sheet);
@@ -703,6 +709,8 @@ function addReplyRows(rows) {
 }
 
 function sendApprovedReplies() {
+  // 返事の在庫からの自動返信（2026-10-17 追加）: 同じ5分おきのトリガーで動かす
+  try { autoReplyFromBank(); } catch (e) { console.log('自動返信でエラー: ' + e); }
   var sh = SpreadsheetApp.getActive().getSheetByName(REPLY_SHEET);
   if (!sh || sh.getLastRow() < 2) return;
   var values = sh.getRange(2, 1, sh.getLastRow() - 1, REPLY_HEADERS.length).getValues();
@@ -903,4 +911,154 @@ function checkQueue(sheet) {
     if (texts[k] > 1) out.sameText.push('同じ本文: ' + futureTextKeys[k] + ' ' + k.split('|')[0] + '「' + k.split('|')[1].slice(0, 20) + '」（' + texts[k] + '行）');
   });
   return out;
+}
+
+
+// ===================================================================
+// 返事の在庫からの自動返信（2026-10-17 追加・オーナー決定）
+// 対象: 投稿キューで「投稿済み」になってから2時間以内の、呼びかけ（「置いて」を含む）のある投稿。
+// そこに来た短いコメント（30文字まで）に、「返事の在庫」タブでオーナーが承認した返事を1件ずつ返す。
+//  ・一言（4文字まで）は「{w}」にコメントをそのまま入れて拾う。5〜30文字は短文の返事
+//  ・31文字以上・自分のコメント・もう返したコメント・返信キューに入っているコメントは返さない
+//  ・1回（5分）に1アカウント1件。返信キューと合わせて1日20件・3分以上あける・制限で止めている間は送らない
+//  ・送ったものは「自動返信の記録」タブに残す（二重に返さないため）
+// ===================================================================
+var BANK_SHEET = '返事の在庫';
+var BANK_HEADERS = ['ブランド', '種類', '返事', '承認', '使った回数', '最後に使った日時'];
+var BK = { brand: 1, kind: 2, text: 3, approved: 4, used: 5, lastUsed: 6 };
+var AUTO_LOG_SHEET = '自動返信の記録';
+var AUTO_LOG_HEADERS = ['ブランド', '投稿ID', 'コメントID', '相手', 'コメント', '返事', '送信時刻', '結果'];
+var AUTO_WINDOW_MS = 2 * 60 * 60 * 1000;
+var AUTO_MAX_LEN = 30;
+
+function getSheetWithHeaders(name, headers) {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name, ss.getSheets().length);
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function addBankRows(rows) {
+  var sh = getSheetWithHeaders(BANK_SHEET, BANK_HEADERS);
+  sh.setColumnWidth(BK.text, 420);
+  var last = sh.getLastRow(), known = {};
+  if (last >= 2) sh.getRange(2, 1, last - 1, 3).getValues().forEach(function (r) { known[r[0] + '|' + r[1] + '|' + r[2]] = true; });
+  var data = [];
+  rows.forEach(function (r) {
+    if (!TOKEN_KEYS[r.brand] || !r.kind || !r.text || known[r.brand + '|' + r.kind + '|' + r.text]) return;
+    data.push([r.brand, r.kind, r.text, false, 0, '']);
+  });
+  if (!data.length) return 0;
+  var start = sh.getLastRow() + 1;
+  sh.getRange(start, 1, data.length, BANK_HEADERS.length).setValues(data);
+  sh.getRange(start, BK.approved, data.length, 1).insertCheckboxes();
+  return data.length;
+}
+
+function threadsGet(token, path, params) {
+  params = params || {};
+  params.access_token = token;
+  var q = Object.keys(params).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); }).join('&');
+  var res = UrlFetchApp.fetch(GRAPH_BASE + '/' + path + '?' + q, { muteHttpExceptions: true });
+  var body = JSON.parse(res.getContentText() || '{}');
+  if (res.getResponseCode() >= 300 || body.error) throw new Error('Threads API ' + res.getResponseCode() + ': ' + JSON.stringify(body.error || body).slice(0, 200));
+  return body;
+}
+
+function autoReplyFromBank() {
+  var ss = SpreadsheetApp.getActive();
+  var bankSh = ss.getSheetByName(BANK_SHEET);
+  if (!bankSh || bankSh.getLastRow() < 2) return;
+  var bank = bankSh.getRange(2, 1, bankSh.getLastRow() - 1, BANK_HEADERS.length).getValues();
+  var postSh = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+  var now = new Date(), today = Utilities.formatDate(now, 'Asia/Tokyo', 'yyyy-MM-dd');
+  var logSh = getSheetWithHeaders(AUTO_LOG_SHEET, AUTO_LOG_HEADERS);
+  var logVals = logSh.getLastRow() >= 2 ? logSh.getRange(2, 1, logSh.getLastRow() - 1, AUTO_LOG_HEADERS.length).getValues() : [];
+
+  // 二重に返さない: 記録・返信キューに入っているコメントID
+  var done = {}, sentToday = {}, lastSent = {};
+  logVals.forEach(function (r) {
+    done[String(r[2])] = true;
+    var t = r[6] ? new Date(r[6]) : null, b = r[0];
+    if (t && String(r[7]) === '送信済み') {
+      if (Utilities.formatDate(t, 'Asia/Tokyo', 'yyyy-MM-dd') === today) sentToday[b] = (sentToday[b] || 0) + 1;
+      if (!lastSent[b] || t > lastSent[b]) lastSent[b] = t;
+    }
+  });
+  var rq = ss.getSheetByName(REPLY_SHEET);
+  if (rq && rq.getLastRow() >= 2) {
+    rq.getRange(2, 1, rq.getLastRow() - 1, REPLY_HEADERS.length).getValues().forEach(function (r) {
+      done[String(r[RC.commentId - 1])] = true;
+      if (String(r[RC.status - 1]) === '送信済み' && r[RC.sentAt - 1]) {
+        var t = new Date(r[RC.sentAt - 1]), b = r[RC.brand - 1];
+        if (Utilities.formatDate(t, 'Asia/Tokyo', 'yyyy-MM-dd') === today) sentToday[b] = (sentToday[b] || 0) + 1;
+        if (!lastSent[b] || t > lastSent[b]) lastSent[b] = t;
+      }
+    });
+  }
+
+  // 対象の投稿（投稿済み・2時間以内・呼びかけあり）
+  var targets = {};
+  var pv = postSh.getRange(2, 1, postSh.getLastRow() - 1, COL_COUNT).getValues();
+  pv.forEach(function (r) {
+    if (String(r[COL.status - 1]) !== '投稿済み' || !r[COL.postedAt - 1]) return;
+    var pa = r[COL.postedAt - 1];
+    var postedAt = pa instanceof Date ? pa : new Date(String(pa).replace(/-/g, '/'));
+    if (isNaN(postedAt.getTime()) || now - postedAt > AUTO_WINDOW_MS) return;
+    if (String(r[COL.text - 1]).indexOf('置いて') < 0) return;
+    var id = String(r[COL.result - 1]).split('/')[0].trim();
+    if (!id) return;
+    var b = r[COL.brand - 1];
+    (targets[b] = targets[b] || []).push(id);
+  });
+
+  Object.keys(targets).forEach(function (brand) {
+    if (replyPausedUntil(brand)) return;
+    if ((sentToday[brand] || 0) >= REPLY_DAILY_MAX) return;
+    if (lastSent[brand] && now - lastSent[brand] < REPLY_GAP_MS) return;
+    var token;
+    try { token = getToken(brand); } catch (e) { return; }
+    var handle = BRAND_HANDLES[brand];
+    for (var p = 0; p < targets[brand].length; p++) {
+      var postId = targets[brand][p], conv;
+      try { conv = threadsGet(token, postId + '/conversation', { fields: 'id,text,username,replied_to,is_reply_owned_by_me', reverse: 'false' }).data || []; }
+      catch (e) { console.log(brand + ' の会話を取れませんでした: ' + e); continue; }
+      var answered = {};
+      conv.forEach(function (c) { if (c.is_reply_owned_by_me && c.replied_to) answered[c.replied_to.id] = true; });
+      var target = null;
+      for (var i = 0; i < conv.length; i++) {
+        var c = conv[i];
+        if (c.is_reply_owned_by_me || c.username === handle || answered[c.id] || done[c.id]) continue;
+        if (!c.replied_to || c.replied_to.id !== postId) continue;  // 投稿への直接のコメントだけ
+        var txt = String(c.text || '').trim();
+        if (!txt || txt.length > AUTO_MAX_LEN) continue;            // 長い相談は返信キューへ
+        target = c; break;
+      }
+      if (!target) continue;
+      var w = String(target.text).trim();
+      var kind = w.length <= 4 ? '一言' : '短文';
+      var choices = [];
+      bank.forEach(function (r, idx) { if (r[BK.brand - 1] === brand && r[BK.kind - 1] === kind && r[BK.approved - 1] === true) choices.push(idx); });
+      if (!choices.length) return;  // 承認された在庫が無ければ送らない
+      choices.sort(function (x, y) { return (bank[x][BK.used - 1] || 0) - (bank[y][BK.used - 1] || 0) || Math.random() - 0.5; });
+      var pick = choices[0];
+      var text = String(bank[pick][BK.text - 1]).replace('{w}', w);
+      var result = '送信済み';
+      try {
+        checkLength('返信', text);
+        publishContainer(token, { media_type: 'TEXT', text: text, reply_to_id: String(target.id) });
+      } catch (e) {
+        result = 'エラー: ' + String(e).slice(0, 200);
+        if (LIMIT_ERROR.test(String(e))) PropertiesService.getScriptProperties().setProperty(pauseKey(brand), String(Date.now() + REPLY_PAUSE_MS));
+      }
+      logSh.appendRow([brand, postId, String(target.id), target.username || '', w, text, now, result]);
+      bankSh.getRange(pick + 2, BK.used).setValue((bank[pick][BK.used - 1] || 0) + 1);
+      bankSh.getRange(pick + 2, BK.lastUsed).setValue(now);
+      return;  // 1回に1アカウント1件
+    }
+  });
 }
