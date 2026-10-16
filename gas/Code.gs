@@ -83,6 +83,8 @@ function authorizeDrive() {
  * トリガーから呼ばれるメイン関数。
  */
 function checkAndPost() {
+  // インスタのリール（2026-10-16 追加）: 同じ15分おきのトリガーで、承認済み・時刻を過ぎたリールを出す
+  try { publishApprovedReels(); } catch (e) { console.log('リールの処理でエラー: ' + e); }
   var ss = SpreadsheetApp.getActive();
   // 「投稿キュー」タブがあればそれを、無ければ最初のタブを使う。
   var sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
@@ -450,6 +452,18 @@ function doPost(e) {
       return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
     }
 
+    // インスタのリール（2026-10-16 追加）
+    if (body.action === 'reels') {
+      response.added = addReelRows(body.rows || []);
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+    if (body.action === 'syncIgfb') {
+      syncIgfb(body);
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
     if (body.action === 'clear') {
       response.cleared = clearPendingRows(sheet, body.dates || []);
       response.ok = true;
@@ -726,5 +740,124 @@ function sendApprovedReplies() {
       sh.getRange(rowIndex, RC.sentAt).setValue(now);
     }
     done[brand] = true; // 1回の実行で1アカウント1件まで（5分ごとのトリガーと合わせて間隔があく）
+  }
+}
+
+
+// ===================================================================
+// インスタのリール（2026-10-16 追加）
+// 流れ: PCが作ったリール（動画の公開URL・曲・カバー・キャプション）を doPost(action:'reels') で
+// 「インスタリール」タブに入れる（承認FALSE）→ オーナーが確認用動画を見て承認 →
+// checkAndPost（15分おき）の中で publishApprovedReels が予定時刻を過ぎた行を出す。
+// 曲は Instagram Audio API の audio_id（Facebookログイン方式の鍵が要る）。
+// 鍵は PC から doPost(action:'syncIgfb') で Script Properties の IGFB_TOKEN_<名前>・IGFB_IGUSER_<名前> に届ける。
+// ===================================================================
+var REEL_SHEET = 'インスタリール';
+var REEL_HEADERS = ['ブランド', '予定日時', '動画URL', '確認用動画', '曲', 'audio_id', 'カバー(ミリ秒)', 'キャプション', '承認', '状態', '結果', '投稿時刻', '入れた日時'];
+var RL = { brand: 1, at: 2, video: 3, preview: 4, song: 5, audioId: 6, thumb: 7, caption: 8, approved: 9, status: 10, result: 11, postedAt: 12, addedAt: 13 };
+var IG_KEYS = { '縁つむぎ婆': 'TSUMUGI', '恋愛の魔女アユ': 'AYU', 'みつえ先生': 'MITSUE', 'まゆみ': 'MAYUMI' };
+var IG_GRAPH = 'https://graph.facebook.com/v23.0';
+var REEL_MAX_PER_RUN = 2;
+
+function getReelSheet() {
+  var ss = SpreadsheetApp.getActive();
+  var sh = ss.getSheetByName(REEL_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(REEL_SHEET);
+    sh.getRange(1, 1, 1, REEL_HEADERS.length).setValues([REEL_HEADERS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(RL.caption, 320);
+  }
+  return sh;
+}
+
+function addReelRows(rows) {
+  if (!rows.length) return 0;
+  var sh = getReelSheet();
+  var now = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy/MM/dd HH:mm');
+  var data = rows.map(function (r) {
+    if (!IG_KEYS[r.brand]) throw new Error('未知のブランド: ' + r.brand);
+    if (String(r.video || '').indexOf('https://') !== 0) throw new Error('動画URLは https の公開URLだけ: ' + r.video);
+    return [r.brand, r.at, r.video, r.preview || '', r.song || '', String(r.audioId || ''),
+            (r.thumb === undefined || r.thumb === null) ? '' : r.thumb, r.caption || '', false, '', '', '', now];
+  });
+  var start = sh.getLastRow() + 1;
+  sh.getRange(start, RL.audioId, data.length, 1).setNumberFormat('@');
+  sh.getRange(start, 1, data.length, REEL_HEADERS.length).setValues(data);
+  sh.getRange(start, RL.approved, data.length, 1).insertCheckboxes();
+  return data.length;
+}
+
+function syncIgfb(body) {
+  var brand = String(body.brand || '');
+  var key = IG_KEYS[brand];
+  var handle = BRAND_HANDLES[brand];
+  if (!key || !handle) throw new Error('未知のブランド: ' + brand);
+  var token = String(body.token || ''), igUser = String(body.igUser || '');
+  if (!token || !igUser) throw new Error('token か igUser が空です');
+  var res = UrlFetchApp.fetch(IG_GRAPH + '/' + igUser + '?fields=username&access_token=' + encodeURIComponent(token), { muteHttpExceptions: true });
+  var me = JSON.parse(res.getContentText() || '{}');
+  if (res.getResponseCode() >= 300 || me.username !== handle) throw new Error('インスタの鍵を確認できませんでした（' + brand + '）');
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty('IGFB_TOKEN_' + key, token);
+  props.setProperty('IGFB_IGUSER_' + key, igUser);
+}
+
+function igCall(method, path, token, params) {
+  var opt = { method: method, muteHttpExceptions: true };
+  var url = IG_GRAPH + '/' + path;
+  params = params || {};
+  params.access_token = token;
+  var q = Object.keys(params).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); }).join('&');
+  if (method === 'get') { url += '?' + q; } else { opt.payload = q; opt.contentType = 'application/x-www-form-urlencoded'; }
+  var res = UrlFetchApp.fetch(url, opt);
+  var body = JSON.parse(res.getContentText() || '{}');
+  if (res.getResponseCode() >= 300 || body.error) throw new Error('インスタAPI ' + res.getResponseCode() + ': ' + JSON.stringify(body.error || body).slice(0, 300));
+  return body;
+}
+
+function publishApprovedReels() {
+  var sh = SpreadsheetApp.getActive().getSheetByName(REEL_SHEET);
+  if (!sh || sh.getLastRow() < 2) return;
+  var values = sh.getRange(2, 1, sh.getLastRow() - 1, REEL_HEADERS.length).getValues();
+  var props = PropertiesService.getScriptProperties();
+  var now = new Date(), done = 0;
+  for (var i = 0; i < values.length && done < REEL_MAX_PER_RUN; i++) {
+    var r = values[i], row = i + 2;
+    var status = String(r[RL.status - 1]).trim();
+    if (r[RL.approved - 1] !== true || (status && status !== '処理中')) continue;
+    var at = r[RL.at - 1] instanceof Date ? r[RL.at - 1] : new Date(String(r[RL.at - 1]).replace(/-/g, '/'));
+    if (isNaN(at.getTime()) || at > now) continue;
+    var key = IG_KEYS[r[RL.brand - 1]];
+    var token = props.getProperty('IGFB_TOKEN_' + key), uid = props.getProperty('IGFB_IGUSER_' + key);
+    try {
+      if (!token || !uid) throw new Error('IGFB_TOKEN_' + key + ' が未設定（PCから syncIgfb で届ける）');
+      var creationId = status === '処理中' ? String(r[RL.result - 1]) : '';
+      if (!creationId) {
+        var p = { media_type: 'REELS', video_url: String(r[RL.video - 1]), caption: String(r[RL.caption - 1] || '') };
+        if (String(r[RL.audioId - 1])) p.audio_configuration = JSON.stringify({ audio_id: String(r[RL.audioId - 1]), audio_volume: 1.0, video_volume: 0.0 });
+        if (String(r[RL.thumb - 1]) !== '') p.thumb_offset = String(r[RL.thumb - 1]);
+        creationId = igCall('post', uid + '/media', token, p).id;
+        sh.getRange(row, RL.status).setValue('処理中');
+        sh.getRange(row, RL.result).setValue(creationId);
+      }
+      var ready = false;
+      for (var w = 0; w < 8; w++) {  // 最大2分待つ。終わらなければ次の15分で続き
+        var st = igCall('get', creationId, token, { fields: 'status_code,status' });
+        if (st.status_code === 'FINISHED') { ready = true; break; }
+        if (st.status_code === 'ERROR' || st.status_code === 'EXPIRED') throw new Error('動画の処理に失敗: ' + (st.status || st.status_code));
+        Utilities.sleep(15000);
+      }
+      if (!ready) continue;
+      var pub = igCall('post', uid + '/media_publish', token, { creation_id: creationId });
+      sh.getRange(row, RL.status).setValue('投稿済み');
+      sh.getRange(row, RL.result).setValue(String(pub.id));
+      sh.getRange(row, RL.postedAt).setValue(now);
+      done++;
+    } catch (e) {
+      sh.getRange(row, RL.status).setValue('エラー');
+      sh.getRange(row, RL.result).setValue(String(e).slice(0, 300));
+      sh.getRange(row, RL.postedAt).setValue(now);
+    }
   }
 }
