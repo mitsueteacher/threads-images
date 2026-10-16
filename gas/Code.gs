@@ -452,6 +452,23 @@ function doPost(e) {
       return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
     }
 
+    // 見出しの修復と在庫の一括承認（2026-10-17 追加）。ブラウザのキー操作は不安定なので、スプシの変更はここから行う
+    if (body.action === 'restoreHeaders') {
+      var hdr = sheet.getRange(1, 1, 1, HEADERS.length).getValues()[0];
+      var fixed = [];
+      HEADERS.forEach(function (h, i) { if (String(hdr[i]).trim() === '') { sheet.getRange(1, i + 1).setValue(h); fixed.push(h); } });
+      response.fixed = fixed;
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+    if (body.action === 'approveBank') {  // オーナーが「全部チェックして」と言った時だけ使う
+      var bsh = SpreadsheetApp.getActive().getSheetByName(BANK_SHEET);
+      var n = bsh ? bsh.getLastRow() - 1 : 0;
+      if (n > 0) bsh.getRange(2, BK.approved, n, 1).setValue(true);
+      response.approved = n;
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
     // 返事の在庫（2026-10-17 追加）: PCから在庫を入れる（承認FALSE）
     if (body.action === 'bank') {
       response.added = addBankRows(body.rows || []);
