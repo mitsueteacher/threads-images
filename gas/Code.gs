@@ -452,6 +452,12 @@ function doPost(e) {
       return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
     }
 
+    // 予約の重複チェック（2026-10-16 追加・オーナー指示「重複は絶対に防ぐ」）。毎朝 daily_report.py が読む
+    if (body.action === 'queueCheck') {
+      response.check = checkQueue(sheet);
+      response.ok = true;
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
     // インスタのリール（2026-10-16 追加）
     if (body.action === 'reels') {
       response.added = addReelRows(body.rows || []);
@@ -860,4 +866,41 @@ function publishApprovedReels() {
       sh.getRange(row, RL.postedAt).setValue(now);
     }
   }
+}
+
+
+// ===================================================================
+// 予約の重複チェック（2026-10-16 追加）
+// これから出る行（状態が空・予定日が今日以降）を数える。
+//  counts: 「日付|ブランド」ごとの本数（Threadsは1日5本のはず）
+//  sameSlot: 同じ予定日時・同じブランドの行が2つ以上
+//  sameText: 同じブランドで本文の先頭60文字（空白を除く）が同じ行（投稿済みの行とも比べる）
+// ===================================================================
+function checkQueue(sheet) {
+  var last = sheet.getLastRow();
+  var out = { total: 0, counts: {}, sameSlot: [], sameText: [] };
+  if (last < 2) return out;
+  var values = sheet.getRange(2, 1, last - 1, COL_COUNT).getValues();
+  var today = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd');
+  var slots = {}, texts = {}, futureTextKeys = {};
+  values.forEach(function (r) {
+    var at = r[COL.datetime - 1];
+    var key = at instanceof Date ? Utilities.formatDate(at, 'Asia/Tokyo', 'yyyy-MM-dd HH:mm') : String(at).trim();
+    var day = key.slice(0, 10);
+    var brand = String(r[COL.brand - 1]);
+    var tkey = brand + '|' + String(r[COL.text - 1]).replace(/\s+/g, '').slice(0, 60);
+    texts[tkey] = (texts[tkey] || 0) + 1;
+    var status = String(r[COL.status - 1]).trim();
+    if (status || day < today || !brand) return;
+    out.total++;
+    out.counts[day + '|' + brand] = (out.counts[day + '|' + brand] || 0) + 1;
+    var skey = key + '|' + brand;
+    slots[skey] = (slots[skey] || 0) + 1;
+    futureTextKeys[tkey] = key;
+  });
+  Object.keys(slots).forEach(function (k) { if (slots[k] > 1) out.sameSlot.push('同じ日時: ' + k + '（' + slots[k] + '行）'); });
+  Object.keys(futureTextKeys).forEach(function (k) {
+    if (texts[k] > 1) out.sameText.push('同じ本文: ' + futureTextKeys[k] + ' ' + k.split('|')[0] + '「' + k.split('|')[1].slice(0, 20) + '」（' + texts[k] + '行）');
+  });
+  return out;
 }
